@@ -1,0 +1,118 @@
+name: Sample java project CI
+
+on:
+  push:
+    branches:
+    - "development"
+    - "staging"
+    - "production"
+  pull_request:
+    branches:
+    - "development"
+
+jobs:
+  get-profile:
+    runs-on: ubuntu-latest
+    env:
+      PROFILE: development
+    outputs:
+      DEPLOY_PROFILE: ${{ env.PROFILE }}
+    steps:
+      - name: is staging?
+        if: github.ref == 'refs/heads/staging'
+        run: echo "PROFILE=staging" >> $GITHUB_ENV
+      - name: is production?
+        if: github.ref == 'refs/heads/production'
+        run: echo "PROFILE=production" >> $GITHUB_ENV
+
+  changes:
+    runs-on: ubuntu-latest
+    # Required permissions
+    permissions:
+      contents: read
+      pull-requests: read
+    # Set job outputs to values from filter step
+    outputs:
+      app1: ${{ steps.filter.outputs.app1 }}
+    steps:
+    - uses: actions/checkout@v3
+    - uses: dorny/paths-filter@v2
+      id: filter
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        filters: |
+          app1:
+            - 'app1/**'
+
+  build-app1:
+    needs: [get-profile, changes]
+    # only build the app if there are changes
+    if: ${{ needs.changes.outputs.app1 == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up JDK
+        uses: actions/setup-java@v3
+        with:
+          java-version: '8'
+          distribution: 'temurin'
+      
+      - name: Configure maven settings
+        uses: s4u/maven-settings-action@v2
+        with:
+          servers: '[{"id": "github", "username": "workflow", "password": "${{ secrets.GITHUB_TOKEN }}"}]'
+          githubServer: false
+      
+      - name: Cache local Maven repository
+        uses: actions/cache@v3
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-app1-${{ hashFiles('**/app1/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-app1-${{ hashFiles('**/app1/pom.xml') }}
+            ${{ runner.os }}-app1-
+      
+      - name: Build with Maven
+        run: cd app1 && mvn clean install -U -P${{ needs.get-profile.outputs.DEPLOY_PROFILE }}
+      
+      - name: Upload artifact
+        if: ${{ github.event_name == 'push' }}
+        uses: actions/upload-artifact@v3
+        with:
+          name: server
+          path: ./app1/target/app1.jar
+      
+  artifact-cleaner:
+    needs: [build-app1]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract branch name
+        if: ${{ github.event_name == 'push' }}
+        shell: bash
+        run: echo "branch=${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}" >> $GITHUB_OUTPUT
+        id: extract_branch
+      - name: List, filter and delete old artifacts
+        if: ${{ github.event_name == 'push' }}
+        uses: actions/github-script@v7
+        id: artifact
+        with:
+          script: |
+            const { owner, repo } = context.issue
+            
+            const res = await github.rest.actions.listArtifactsForRepo({
+                owner,
+                repo
+            });
+            console.log("current workflow run id :", "${{ github.run_id }}");
+            res.data.artifacts
+              .filter(a => {
+                  return a.workflow_run.head_branch === "${{ steps.extract_branch.outputs.branch }}" && a.workflow_run.id !== "${{ github.run_id }}"; 
+              })
+              .forEach(a => {
+                  console.log("Deleting : " + a.id, a.name, "from ${{ steps.extract_branch.outputs.branch }} created at", a.created_at);
+                  github.rest.actions.deleteArtifact({
+                      owner,
+                      repo,
+                      artifact_id: a.id,
+                  })
+              });
